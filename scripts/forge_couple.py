@@ -1,6 +1,9 @@
 import re
 from json import dumps
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from modules.processing import StableDiffusionProcessing as P
 
 from lib_couple import settings  # noqa
 from lib_couple.attention_couple import AttentionCouple
@@ -25,7 +28,7 @@ else:
 
 from modules import scripts, shared
 
-VERSION = "7.0.7"
+VERSION = "7.1.0"
 
 UI_CACHES: dict[bool, tuple[list, Callable]] = {}
 
@@ -92,8 +95,10 @@ class ForgeCouple(scripts.Script):
             print("")
             logger.info(f"[Tile Debug]\n{p.prompt}\n")
 
-    def before_hr(self, *args, **kwargs):
+    def before_hr(self, p: "P", *args, **kwargs):
         self.is_hr = True
+        if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
+            AttentionCoupleAnima.unpatch()
 
     def _is_tile(self) -> bool:
         return self.is_img2img and len(self.tiles) > 0
@@ -132,7 +137,7 @@ class ForgeCouple(scripts.Script):
 
     def after_extra_networks_activate(
         self,
-        p,
+        p: "P",
         enable: bool,
         disable_hr: bool,
         mode: str,
@@ -235,13 +240,13 @@ class ForgeCouple(scripts.Script):
         self.couples = couples
         self.valid = True
 
-    def before_process_batch(self, p, *args, **kwargs):
+    def before_process_batch(self, p: "P", *args, **kwargs):
         if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
             AttentionCoupleAnima.unpatch()
 
     def process_before_every_sampling(
         self,
-        p,
+        p: "P",
         enable: bool,
         disable_hr: bool,
         mode: str,
@@ -266,8 +271,8 @@ class ForgeCouple(scripts.Script):
             return
 
         # ===== Init =====
-        WIDTH: int = p.width
-        HEIGHT: int = p.height
+        WIDTH: int = p.hr_upscale_to_x if self.is_hr else p.width
+        HEIGHT: int = p.hr_upscale_to_y if self.is_hr else p.height
         IS_HORIZONTAL: bool = direction == "Horizontal"
         NO_BACKGROUND: bool = background == "None"
 

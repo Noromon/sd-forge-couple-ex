@@ -1,3 +1,7 @@
+### v7.1.0 - 2026 May.28
+- Improve `compatibility`
+- Fix `unpatch`
+
 ### v7.0.7 - 2026 May.13
 - Fix `shape`
 
