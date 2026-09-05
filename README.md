@@ -4,7 +4,7 @@ This is an Extension for the Forge Webui, which allows you to ~~generate couples
 > [!NOTE]
 > - Ideas by human, implementation by LLM (*within 48h* so it might not be that elegant)
 > - Experimental in nature; provided **as-is** without any technical support or maintenance commitment
-> - Only limited real-world testing has been done on **Anima**
+> - Only limited real-world testing has been done on **Anima** and **Forge Neo**
 
 > Support [Forge Classic](https://github.com/Haoming02/sd-webui-forge-classic/tree/classic) / [Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo)
 

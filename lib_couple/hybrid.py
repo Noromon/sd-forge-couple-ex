@@ -127,6 +127,15 @@ def _stack_region_masks(fc_args: dict, n_regions: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _as_patcher(x):
+    """Unwrap a CLIP wrapper to its ModelPatcher; pass through real patchers.
+
+    forge_objects.clip is a `CLIP` object whose LoRA patches / model live on
+    `.patcher` (a ModelPatcher), while forge_objects.unet IS a ModelPatcher.
+    """
+    return x.patcher if hasattr(x, "patcher") else x
+
+
 def _bake_patcher(patcher):
     """Bake a ModelPatcher's pending LoRA patches into the shared nn.Module.
 
@@ -266,7 +275,8 @@ def _prepare_regions(
     clip_orig = sd_model.forge_objects_original.clip
     if clip_orig is not None:
         active_clip = sd_model.forge_objects.clip
-        _restore_from_backup(active_clip)
+        _restore_from_backup(_as_patcher(active_clip))
+
 
     region_modules: list[list] = []
     region_contexts: list[Optional[torch.Tensor]] = []
@@ -302,7 +312,8 @@ def _prepare_regions(
         #     get_learned_conditioning uses forge_objects.clip.patcher, so swap it in. ---
         ctx = None
         if clip_orig is not None:
-            _bake_patcher(clip_r)
+            _bake_patcher(_as_patcher(clip_r))
+
             saved_clip = sd_model.forge_objects.clip
             try:
                 sd_model.forge_objects.clip = clip_r
@@ -321,7 +332,8 @@ def _prepare_regions(
         # --- Restore base before the next region so diffs don't accumulate ---
         _restore_from_backup(unet_r)
         if clip_orig is not None:
-            _restore_from_backup(clip_r)
+            _restore_from_backup(_as_patcher(clip_r))
+
 
         logger.info(
             f"[Hybrid] Region {r + 1}/{n_regions} prepared "
