@@ -261,13 +261,12 @@ Real-world comparisons generated with **Anima** - each pair uses a different cha
 
 ##### Comparison 1 - Sleeping in a Train Carriage (Luo Tianyi (Mangzhong) & Hatsune Miku (Shaohua))
 
-<p align="center">
-<img src="example/sep_compare_1/char_left.jpg" width="256"><br>
-<b>Luo Tianyi (Mangzhong)</b>
-&nbsp;&nbsp;&nbsp;
-<img src="example/sep_compare_1/char_right.jpg" width="256"><br>
-<b>Hatsune Miku (Shaohua)</b>
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img src="example/sep_compare_1/char_left.jpg" width="256" /><br /><b>Luo Tianyi (Mangzhong)</b></td>
+    <td align="center"><img src="example/sep_compare_1/char_right.jpg" width="256" /><br /><b>Hatsune Miku (Shuhua)</b></td>
+  </tr>
+</table>
 
 | | Attention | Latent | Hybrid | Independent |
 | :-- | :--: | :--: | :--: | :--: |
@@ -316,13 +315,12 @@ hand, (cyan nails :1.1),
 
 ##### Comparison 2 - Selfie (Stardust V4 & XinHua AI)
 
-<p align="center">
-<img src="example/sep_compare_2/char_left.jpg" width="256"><br>
-<b>Stardust V4</b>
-&nbsp;&nbsp;&nbsp;
-<img src="example/sep_compare_2/char_right.jpg" width="256"><br>
-<b>Xinhua AI</b>
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img src="example/sep_compare_2/char_left.jpg" width="256" /><br /><b>Stardust V4</b></td>
+    <td align="center"><img src="example/sep_compare_2/char_right.jpg" width="256" /><br /><b>Xinhua AI</b></td>
+  </tr>
+</table>
 
 | | Attention | Latent | Hybrid | Independent |
 | :-- | :--: | :--: | :--: | :--: |
@@ -379,13 +377,12 @@ asymmetrical docking, (selfie :1.2),
 
 ##### Comparison 3 - Heart Hands (Luo Tianyi V4J & V4C)
 
-<p align="center">
-<img src="example/sep_compare_3/char_left.jpg" width="256"><br>
-<b>Luo Tianyi V4J (JP ver.)</b>
-&nbsp;&nbsp;&nbsp;
-<img src="example/sep_compare_3/char_right.jpg" width="256"><br>
-<b>Luo Tianyi V4C (CN ver.)</b>
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img src="example/sep_compare_3/char_left.jpg" width="256" /><br /><b>Luo Tianyi V4J (JP ver.)</b></td>
+    <td align="center"><img src="example/sep_compare_3/char_right.jpg" width="256" /><br /><b>Luo Tianyi V4C (CN ver.)</b></td>
+  </tr>
+</table>
 
 | | Attention | Latent | Hybrid | Independent |
 | :-- | :--: | :--: | :--: | :--: |
@@ -498,7 +495,9 @@ Steps: 32, Sampler: Euler a, Schedule type: Normal, CFG scale: 5, Shift: 3, Seed
 
 ### LoRA Support
 
-LoRA that contains multiple subjects is easier to generate multiple characters. Using different LoRAs in different regions depends on how well the LoRAs' concepts work together...
+~~LoRA that contains multiple subjects is easier to generate multiple characters. Using different LoRAs in different regions depends on how well the LoRAs' concepts work together...~~
+
+You can now use **different LoRAs in different regions**. In this case, using the **Hybrid** mode yields better results than the original `Attention` mode - see [Separation Modes](#separation-modes) for details.
 
 <br><hr><br>
 
