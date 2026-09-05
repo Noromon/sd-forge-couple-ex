@@ -1,2 +1,4 @@
 __pycache__
 *.json
+example/sep_compare_*/grid.jpg
+scripts/make_grid.py
