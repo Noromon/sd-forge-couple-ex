@@ -264,7 +264,7 @@ Real-world comparisons generated with **Anima** - each pair uses a different cha
 <table align="center">
   <tr>
     <td align="center"><img src="example/sep_compare_1/char_left.jpg" width="256" /><br /><b>Luo Tianyi (Mangzhong)</b></td>
-    <td align="center"><img src="example/sep_compare_1/char_right.jpg" width="256" /><br /><b>Hatsune Miku (Shuhua)</b></td>
+    <td align="center"><img src="example/sep_compare_1/char_right.jpg" width="256" /><br /><b>Hatsune Miku (Shaohua)</b></td>
   </tr>
 </table>
 
