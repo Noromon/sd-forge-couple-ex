@@ -184,6 +184,149 @@ def couple_ui(script, is_img2img: bool, title: str):
                 common_debug = gr.Checkbox(False, label="Debug", scale=1)
                 common_debug.do_not_save_to_config = True
 
+        with gr.Accordion(
+            label="Separation Mode",
+            elem_id=f"forge_couple_sep_{m}",
+            open=False,
+        ):
+            with gr.Row():
+                separation_mode = gr.Radio(
+                    ["Attention", "Latent", "Hybrid", "Independent"],
+                    label="Separation Method",
+                    value="Attention",
+                    scale=2,
+                    info=(
+                        "Attention: mask blending after shared forward | "
+                        "Latent: independent forward per region (stronger isolation) | "
+                        "Hybrid: global self-attn + per-region cross-attn/MLP (1x time, no seam) | "
+                        "Independent: n full passes with per-region LoRA weights, fully isolated (n x time)"
+                    ),
+                )
+
+            with gr.Group(visible=True, elem_classes="fc_sharp") as sharp_settings:
+                with gr.Row():
+                    mask_mode = gr.Radio(
+                        ["Soft", "Hard", "Temperature"],
+                        label="Mask Sharpening",
+                        value="Soft",
+                        scale=2,
+                        info="Soft: original blending | Hard: winner-take-all | Temperature: adjustable",
+                    )
+                    mask_temperature = gr.Slider(
+                        minimum=0.01,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.5,
+                        label="Temperature",
+                        info="Lower = sharper separation (only used in Temperature mode)",
+                        scale=3,
+                        interactive=False,
+                    )
+
+            with gr.Group(visible=False, elem_classes="fc_blend") as blend_settings:
+                with gr.Row():
+                    blend_mode = gr.Radio(
+                        ["Hard", "Feather"],
+                        label="Region Blend",
+                        value="Hard",
+                        scale=2,
+                        info=(
+                            "How per-region results are merged in latent space. "
+                            "Hard: crisp region boundaries | Feather: soft transition band"
+                        ),
+                    )
+                    feather_width = gr.Slider(
+                        minimum=0,
+                        maximum=64,
+                        step=1,
+                        value=8,
+                        label="Feather Width (px)",
+                        info="Transition width in pixels (only used in Feather mode)",
+                        scale=3,
+                        interactive=False,
+                    )
+
+            with gr.Group(visible=False, elem_classes="fc_hybrid") as hybrid_settings:
+                with gr.Row():
+                    boundary_mode = gr.Radio(
+                        ["Hard", "Soft"],
+                        label="Boundary Transition",
+                        value="Soft",
+                        scale=2,
+                        info=(
+                            "How regions are routed at the token level. "
+                            "Hard: each pixel belongs to exactly one region | "
+                            "Soft: Gaussian-blended transition band (smooths seams)"
+                        ),
+                    )
+                    soft_width = gr.Slider(
+                        minimum=0,
+                        maximum=128,
+                        step=1,
+                        value=16,
+                        label="Transition Width (px)",
+                        info="Width of the blended boundary band (only used in Soft mode)",
+                        scale=3,
+                        interactive=True,  # default boundary_mode is "Soft" -> active on load
+                    )
+                    soft_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=1.0,
+                        label="Soft Strength",
+                        info="1.0 = fully blurred weights | 0.0 = hard argmax (only used in Soft mode)",
+                        scale=3,
+                        interactive=True,  # default boundary_mode is "Soft" -> active on load
+                    )
+
+            def on_mask_mode_change(choice: str):
+                return gr.update(interactive=(choice == "Temperature"))
+
+            mask_mode.change(
+                on_mask_mode_change,
+                mask_mode,
+                mask_temperature,
+                show_progress="hidden",
+            )
+
+            def on_blend_mode_change(choice: str):
+                return gr.update(interactive=(choice == "Feather"))
+
+            blend_mode.change(
+                on_blend_mode_change,
+                blend_mode,
+                feather_width,
+                show_progress="hidden",
+            )
+
+            def on_boundary_mode_change(choice: str):
+                return [
+                    gr.update(interactive=(choice == "Soft")),
+                    gr.update(interactive=(choice == "Soft")),
+                ]
+
+            boundary_mode.change(
+                on_boundary_mode_change,
+                boundary_mode,
+                [soft_width, soft_strength],
+                show_progress="hidden",
+            )
+
+            def on_separation_mode_change(choice: str):
+                return [
+                    gr.update(visible=(choice == "Attention")),
+                    gr.update(visible=(choice in ("Independent",))),
+                    gr.update(visible=(choice == "Hybrid")),
+                ]
+
+            separation_mode.change(
+                on_separation_mode_change,
+                separation_mode,
+                [sharp_settings, blend_settings, hybrid_settings],
+                show_progress="hidden",
+            )
+
         def on_mode_change(choice: str):
             return [
                 gr.update(visible=(choice in ("Basic", "Mask"))),
@@ -211,6 +354,14 @@ def couple_ui(script, is_img2img: bool, title: str):
             (background_weight, "forge_couple_background_weight"),
             (mapping_paste_field, "forge_couple_mapping"),
             (common_parser, "forge_couple_common_parser"),
+            (separation_mode, "forge_couple_separation_mode"),
+            (mask_mode, "forge_couple_mask_mode"),
+            (mask_temperature, "forge_couple_mask_temperature"),
+            (blend_mode, "forge_couple_blend_mode"),
+            (feather_width, "forge_couple_feather_width"),
+            (boundary_mode, "forge_couple_boundary_mode"),
+            (soft_width, "forge_couple_soft_width"),
+            (soft_strength, "forge_couple_soft_strength"),
         ]
 
         for comp, name in script.infotext_fields:
@@ -237,5 +388,13 @@ def couple_ui(script, is_img2img: bool, title: str):
         common_parser,
         common_debug,
         def_in_prompt,
+        separation_mode,
+        mask_mode,
+        mask_temperature,
+        blend_mode,
+        feather_width,
+        boundary_mode,
+        soft_width,
+        soft_strength,
         *tile_args,
     ], couple_mask.get_masks

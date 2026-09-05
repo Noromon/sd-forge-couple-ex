@@ -1,6 +1,11 @@
 ﻿# SD Forge Attention Couple
 This is an Extension for the Forge Webui, which allows you to ~~generate couples~~ target different conditionings at specific regions. No more color bleeds or mixed features!
 
+> [!NOTE]
+> - Ideas by human, implementation by LLM (*within 48h* so it might not be that elegant)
+> - Experimental in nature; provided **as-is** without any technical support or maintenance commitment
+> - Only limited real-world testing has been done on **Anima**
+
 > Support [Forge Classic](https://github.com/Haoming02/sd-webui-forge-classic/tree/classic) / [Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo)
 
 ## Showcase
@@ -45,6 +50,7 @@ This is an Extension for the Forge Webui, which allows you to ~~generate couples
     - [Tile Direction](#tile-direction)
 - [Advanced Mode](#advanced-mode)
 - [Mask Mode](#mask-mode)
+- [Separation Modes](#separation-modes)
 - Misc.
     - [Global Effect](#global-effect)
     - [Compatibility](#compatibility-toggle)
@@ -214,6 +220,219 @@ treasure chest
 
 <br><hr><br>
 
+### Separation Modes
+
+When different regions use different LoRAs or styles, their features tend to bleed across region boundaries. The **Separation Method** control lets you choose how strictly each region is isolated:
+
+| Mode | Isolation | Seam Coherence | Cost | Best For |
+| :-- | :-- | :-- | :-- | :-- |
+| `Attention` *(original)* | Low | High | 1x | Light separation, similar LoRAs |
+| **`Hybrid`** *(recommended)* | Full | High | ~1x | Different LoRAs per region without hard seams |
+| `Independent` | Strongest | Low | n x | Experimental: absolute isolation |
+| `Latent` | Medium | Medium | 1x | Slightly stronger than Attention |
+
+#### Attention *(Original)*
+
+A single shared forward pass where all regions attend to the same k/v, with per-region attention outputs mask-blended afterwards. Lightest and fastest; works well when the LoRAs are not very different from each other. The **Mask Sharpening** control (`Soft` / `Hard` / adjustable `Temperature`) applies here to make the blending sharper.
+
+#### Hybrid *(Recommended)*
+
+Hybrid keeps **self-attention global** while routing **cross-attention and MLP per region**:
+
+1. **Self-attention stays global with base weights** - every spatial token sees all others simultaneously, so composition, pose, and proportion remain coherent across regions from the first step to the last. This is what removes the "dimension wall" at seams that fully-independent approaches produce.
+2. **Cross-attention & MLP are routed per region** - each token uses its own region's LoRA-patched sub-modules (and its own text context, with TE LoRAs isolated too), so features never bleed across regions despite sharing a single pass.
+
+Cost is ~1x steps *(vs n x for Independent)*. The **Boundary Transition** control decides how tokens are assigned at the border: `Hard` gives each pixel to exactly one region; `Soft` blends a Gaussian transition band whose size and mix you tune with **Transition Width (px)** and **Soft Strength**.
+
+#### Independent *(Experimental)*
+
+A proof-of-concept for *absolute* LoRA isolation: n full inference passes, one per region, each running on base model + only that region's LoRAs. Isolation is total - but regions never see each other at all, which produces hard seams and costs n x time. Recommended for experimental use; prefer **Hybrid** for actual generation. Per-region `<lora:...>` tags in the prompt are parsed & applied independently, and the **Region Blend** control (`Hard` / `Feather`) merges the per-region latents.
+
+#### Latent
+
+The earliest separation attempt: instead of one shared forward, each region runs its own attention against its own k/v and the outputs are mask-blended - stronger isolation than `Attention`, still a single pass.
+
+#### Comparison Showcase
+
+Real-world comparisons generated with **Anima** - each pair uses a different character LoRA per region. The single-character references show what each character is supposed to look like; compare how well each mode keeps them distinct and coherent at the seam.
+
+> [!NOTE]
+> The **Low LoRA Weight** rows use lowered LoRA weights *(style `1.0` → `0.6`, characters `0.7` → `0.5`)* to test better compatibility under the `Attention` / `Latent` modes
+
+##### Comparison 1 - Sleeping in a Train Carriage (Luo Tianyi (Mangzhong) & Hatsune Miku (Shaohua))
+
+<p align="center">
+<img src="example/sep_compare_1/char_left.jpg" width="256"><br>
+<b>Luo Tianyi (Mangzhong)</b>
+&nbsp;&nbsp;&nbsp;
+<img src="example/sep_compare_1/char_right.jpg" width="256"><br>
+<b>Hatsune Miku (Shaohua)</b>
+</p>
+
+| | Attention | Latent | Hybrid | Independent |
+| :-- | :--: | :--: | :--: | :--: |
+| **Normal Weights** | <img src="example/sep_compare_1/attention.jpg" width=384> | <img src="example/sep_compare_1/latent.jpg" width=384> | <img src="example/sep_compare_1/hybrid.jpg" width=384> | <img src="example/sep_compare_1/independent.jpg" width=384> |
+| **Low LoRA Weight** | <img src="example/sep_compare_1/attention_low.jpg" width=384> | <img src="example/sep_compare_1/latent_low.jpg" width=384> | — | — |
+
+<details>
+<summary>Prompt</summary>
+
+```
+{comm: 
+(masterpiece), best quality, score 9,
+(2girls :1.4), (side by side), 
+(@houkisei :0.2), (@suzumi narumi :0.2), (@alpha \(yukai na nakamatachi\) :0.2),
+<lora:style-a:1>,  (loranlchstyle :1),
+}, 
+<lora:char-b:0.7>, (ltymz :1), (hair-ltymz), (hairflower-ltymz), (chinadress-ltymz :1), (armlet-ltymz :1), (highheels-ltymz :1),
+low twintails, (luo tianyi :0.6),
+china dress, pelvic curtain,
+(shiny skin), (glistening skin :1.2), (glistening body), (light skin),
+(medium breasts), 
+(hands :1.2), nails,
+{comm2: 
+sleeping, (closed eyes), u u, 
+(sitting), (sitting on seat), reclining, relaxed, (arms at sides :1.2), (hands down), 
+(leaning to the side :1.4), (leaning on object), (leaning on), (leaning), 
+(leaning on person), 
+interior view, (interior), (subway train), (rapid transit :1.2), (train interior :1.4), seat, (window),
+handbag, briefcase,
+(overpass :1.2), bridge,
+lake, (city), (sunset), cloudy, (orange sky), dusk, dusk shine, city horizon,
+shiny, (backlighting :1.3), (raythalosm :1.3), (lens flare), (dramatic lighting :1.3), (detailed lighting :1.2), (ambient lighting :1.2),
+}, 
+BREAK
+{comm}, 
+<lora:char-c:0.7>, (mikush :1), (hair-mikush), chinadress-mikush, brooch-mikush, (shoes-mikush :1),
+(light green hair :1), short sleeves, bare legs, china dress, (pelvic curtain :1),
+(white socks), black shoes, 
+(shiny skin :1.2), (glistening body :1.2), (glistening skin), (light skin),
+medium breasts, 
+hand, (cyan nails :1.1),
+{comm2},
+```
+
+</details>
+
+##### Comparison 2 - Selfie (Stardust V4 & XinHua AI)
+
+<p align="center">
+<img src="example/sep_compare_2/char_left.jpg" width="256"><br>
+<b>Stardust V4</b>
+&nbsp;&nbsp;&nbsp;
+<img src="example/sep_compare_2/char_right.jpg" width="256"><br>
+<b>Xinhua AI</b>
+</p>
+
+| | Attention | Latent | Hybrid | Independent |
+| :-- | :--: | :--: | :--: | :--: |
+| **Normal Weights** | <img src="example/sep_compare_2/attention.jpg" width=384> | <img src="example/sep_compare_2/latent.jpg" width=384> | <img src="example/sep_compare_2/hybrid.jpg" width=384> | <img src="example/sep_compare_2/independent.jpg" width=384> |
+| **Low LoRA Weight** | <img src="example/sep_compare_2/attention_low.jpg" width=384> | <img src="example/sep_compare_2/latent_low.jpg" width=384> | — | — |
+
+<details>
+<summary>Prompt</summary>
+
+```
+{comm:
+(masterpiece), best quality, score 9,
+(2girls), (side by side),
+(2girls taking selfie side by side, the left one is stardustv4, the right one is xinhuaai),
+(@houkisei :0.2), (@suzumi narumi :0.2), (@alpha \(yukai na nakamatachi\) :0.2),
+<lora:style-d:1>, (lorameionstyle :1),
+}
+<lora:char-e:0.7>, stardustv4, hair-stardustv4, costume-stardustv4, (thighboots-stardustv4 :1),
+yellow eyes, light purple hair, (quad tails :1.3), ahoge, (long locks),
+(bare shoulders), (halterneck), (halter dress), (two-sided dress),
+(elbow gloves), (fingerless gloves),
+(thigh high boots), (high heels),
+(shiny skin :1.2), (light skin), glistening skin, glistening body,
+(medium breasts), (cleavage),
+hands, purple nails,
+(blushing :1.2), (heavy breathing :1.3), (sweat :1.5), open mouth, lidded eyes,
+(looking up), (looking at viewer),
+(yuri :1.3), (symmetry :1.3),
+light smile, (standing), (hands :1), asymmetrical docking, (selfie :1.2),
+{comm2:
+(full body :1.4), (duo focus),
+(simple background :1.3), (white background :1.3),
+shiny, (lighting :1.3), (raythalosm :1.3), (lens flare), (dramatic lighting :1.3), (detailed lighting :1.2), (ambient lighting :1.2),
+}
+BREAK
+{comm},
+<lora:char-f:0.7>,  (xinhuaai :1), (hair-xinhuaai :1.2), (costume-xinhuaai :1.2), (footwear-xinhuaai :1),
+(long hair), (multicolored hair), pink eyes, hairpin, pink beret,
+microskirt, sleeveless shirt, uneven gloves,
+thighhighs, leather shoes,
+(asymmetrical gloves), single elbow glove, (fingerless gloves),
+(shiny skin :1.2), (light skin :1.2), glistening body, glistening skin,
+big breasts, 
+hands, pink nails,
+lidded eyes, open mouth, evil smile,
+(yuri :1.3), (symmetry :1.3),
+light smile, (standing),
+(looking up), (looking at viewer),
+asymmetrical docking, (selfie :1.2),
+{comm2},
+```
+
+</details>
+
+##### Comparison 3 - Heart Hands (Luo Tianyi V4J & V4C)
+
+<p align="center">
+<img src="example/sep_compare_3/char_left.jpg" width="256"><br>
+<b>Luo Tianyi V4J (JP ver.)</b>
+&nbsp;&nbsp;&nbsp;
+<img src="example/sep_compare_3/char_right.jpg" width="256"><br>
+<b>Luo Tianyi V4C (CN ver.)</b>
+</p>
+
+| | Attention | Latent | Hybrid | Independent |
+| :-- | :--: | :--: | :--: | :--: |
+| **Normal Weights** | <img src="example/sep_compare_3/attention.jpg" width=384> | <img src="example/sep_compare_3/latent.jpg" width=384> | <img src="example/sep_compare_3/hybrid.jpg" width=384> | <img src="example/sep_compare_3/independent.jpg" width=384> |
+| **Low LoRA Weight** | <img src="example/sep_compare_3/attention_low.jpg" width=384> | <img src="example/sep_compare_3/latent_low.jpg" width=384> | — | — |
+
+<details>
+<summary>Prompt</summary>
+
+```
+{comm: 
+(masterpiece), best quality, score 9,
+(2girls :1.4), (side by side), 
+(@houkisei :0.2), (@suzumi narumi :0.2), (@alpha \(yukai na nakamatachi\) :0.2),
+<lora:style-g:1>,  (loramacastyle :1),
+}, 
+<lora:char-h:0.7>, (ltyv4j :1), (hair-ltyv4j :1), (costume-ltyv4j :1), (footwear-ltyv4j :1),
+(luo tianyi :1),
+(grey hair:1.2), (green eyes :1.2), (short hair with long locks :1.2), (low twintails :0.8), 
+off-shoulder shirt, crop top, yellow shorts,
+midriff, stomach, (linea alba :1.2),
+aqua thighhighs, high heels,
+(shiny skin :1.2),
+big breasts, 
+hands, blue nails,
+{comm2: 
+(yuri :1.3), (symmetry :1.3),
+light smile, (standing), asymmetrical docking, (symmetrical hand pose :1.4), 
+(heart hands duo :1.3), (heart hands :1.4),
+(full body :1.4), (duo focus), (high angle :1.2), (foreshortening), 
+(indoors), (bedroom), shiny, (sidelighting :1.3), (raythalosm :1.3), (lens flare), (dramatic lighting :1.3), (detailed lighting :1.2), (ambient lighting :1.2),
+}, 
+BREAK
+{comm}, 
+<lora:char-i:0.7>,  (ltyv4c :1), (hair-ltyv4c :1), (headset-ltyv4c :1), (dress-ltyv4c :1), (necktie-ltyv4c :1), (sleeves-ltyv4c :1), (bracelet-ltyv4c :1), (socks-ltyv4c :1), (boots-ltyv4c :1),
+(grey hair), (green eyes :1.2), (short hair with long locks :1), (luo tianyi :1),
+microskirt,
+single thighhigh, single kneehigh, 
+(asymmetrical footwear),
+(shiny skin :1.2), (light skin :1.2), glistening body, glistening skin,
+big breasts,
+(hands), blue nails,
+{comm2},
+```
+
+</details>
+
 ### Global Effect
 
 In **Basic** and **Mask** modes, you can set either the **first** line or the **last** line of the positive prompt as the "background," affecting the entire image, useful for styles or quality tags.
@@ -221,6 +440,7 @@ In **Basic** and **Mask** modes, you can set either the **first** line or the **
 ### Compatibility Toggle
 
 When this is enabled, the Extension will not function during the `Hires. Fix` pass.
+*Personal suggestion: Turn this thing **OFF** while using multiple LoRAs.*
 
 ### Couple Separator
 
@@ -371,6 +591,7 @@ For usages with API, please refer to the [Wiki](https://github.com/Haoming02/sd-
 <pre align="center">
 Copyright (C) 2023 laksjdjf
 Copyright (C) 2026 Haoming02
+Copyright (C) 2026 Noromon
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

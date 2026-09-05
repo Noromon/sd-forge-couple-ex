@@ -58,6 +58,33 @@ def get_dit_mask(mask: torch.Tensor, seq_len: int, w: int, h: int, patch_size: i
     return mask_flattened.view(num_conds, 1, seq_len, 1)
 
 
+def sharpen_mask(mask: torch.Tensor, mode: str, temperature: float) -> torch.Tensor:
+    """Sharpen the mask to increase regional separation.
+
+    Args:
+        mask: mask tensor of shape [num_conds, ...] (already normalized so sum=1 along dim 0)
+        mode: "Soft" (no change), "Hard" (argmax winner-take-all), "Temperature" (power sharpening)
+        temperature: sharpening temperature, lower = sharper. Only used in "Temperature" mode.
+
+    Returns:
+        Sharpened mask with the same shape.
+    """
+    if mode == "Soft" or temperature >= 1.0:
+        return mask
+
+    if mode == "Hard":
+        # Winner-take-all: each spatial position belongs entirely to one region
+        hard_idx = mask.argmax(dim=0, keepdim=True)
+        result = torch.zeros_like(mask)
+        result.scatter_(0, hard_idx, 1.0)
+        return result
+
+    # Temperature mode: sharpen via power law
+    mask = mask.clamp(min=1e-6) ** (1.0 / temperature)
+    mask = mask / mask.sum(dim=0, keepdim=True)
+    return mask
+
+
 def lcm(a: int, b: int) -> int:
     return a * b // math.gcd(a, b)
 

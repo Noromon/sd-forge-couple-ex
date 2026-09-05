@@ -1,3 +1,12 @@
+### v8.0.0 - 2026 Sep.04
+- **Separation Method** selector: `Attention` / `Latent` / `Hybrid` / `Independent`
+    - **Hybrid**: global self-attn + per-region cross-attn/MLP; full LoRA isolation with coherent composition at seams (~1x time); new **Boundary Transition** control (`Hard` / Gaussian-blended `Soft`)
+    - **Independent**: n full passes, one per region, each with its own LoRA weights (n x time); per-region `<lora:...>` tags; new **Region Blend** control (`Hard` / `Feather`)
+    - **Latent**: separate attention per region instead of a single shared forward (stronger isolation than Attention)
+    - Works on Anima (DiT), SDXL & SD1.5 (UNet)
+- **Mask Sharpening**: `Soft` / `Hard` / adjustable `Temperature` for sharper region separation
+- Fix Tile Mode arg indices
+
 ### v7.1.0 - 2026 May.28
 - Improve `compatibility`
 - Fix `unpatch`
