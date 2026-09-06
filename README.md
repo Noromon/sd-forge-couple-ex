@@ -1,6 +1,16 @@
 ﻿# SD Forge Attention Couple
 This is an Extension for the Forge Webui, which allows you to ~~generate couples~~ target different conditionings at specific regions. No more color bleeds or mixed features!
 
+> [!NEW]
+> ### Fork Additions by Noromon (v8.0.0)
+> This fork introduces **3 new Separation Modes** and **Mask Sharpening**, enabling full per-region LoRA isolation on Anima / SDXL / SD1.5:
+> - **Hybrid** *(recommended)* — global self-attention + per-region cross-attention/MLP; ~1x cost, no hard seams
+> - **Independent** *(experimental)* — n fully independent passes with per-region LoRAs; absolute isolation
+> - **Latent** — per-region attention in a single pass; stronger than the original Attention mode
+> - **Mask Sharpening** (`Soft` / `Hard` / adjustable `Temperature`) for sharper region separation
+>
+> See [Separation Modes](#separation-modes) for details and real-world comparisons.
+
 > [!NOTE]
 > - Ideas by human, implementation by LLM (*within 48h* so it might not be that elegant)
 > - Experimental in nature; provided **as-is** without any technical support or maintenance commitment
@@ -586,6 +596,8 @@ For usages with API, please refer to the [Wiki](https://github.com/Haoming02/sd-
 
 ## Special Thanks
 - Credits to the original author, **[laksjdjf](https://github.com/laksjdjf)**, whose [ComfyUI Node](https://github.com/laksjdjf/cgem156-ComfyUI/tree/main/scripts/attention_couple) I referenced to port into Forge
+- Credits to the extension author, **[Haoming02](https://github.com/Haoming02)** for Forge Couple
+- The **Separation Modes** (`Hybrid` / `Independent` / `Latent`) and **Mask Sharpening** features in this fork are implemented by **[Noromon](https://github.com/Noromon)**
 
 <pre align="center">
 Copyright (C) 2023 laksjdjf
