@@ -510,27 +510,41 @@ class ForgeCouple(scripts.Script):
         fc_param["forge_couple_def_in_prompt"] = def_in_prompt
 
         # ===== Separation Mode & Mask Sharpening (infotext) =====
-        # args layout (after the 9 named params):
-        #   common_parser(0), common_debug(1), def_in_prompt(2),
-        #   separation_mode(3), mask_mode(4), mask_temperature(5),
-        #   blend_mode(6), feather_width(7), boundary_mode(8), soft_width(9),
-        #   soft_strength(10), use_tile(11), ...
-        if len(args) >= 4:
-            fc_param["forge_couple_separation_mode"] = args[3]
-        if len(args) >= 5:
-            fc_param["forge_couple_mask_mode"] = args[4]
-        if len(args) >= 6:
-            fc_param["forge_couple_mask_temperature"] = args[5]
-        if len(args) >= 7:
-            fc_param["forge_couple_blend_mode"] = args[6]
-        if len(args) >= 8:
-            fc_param["forge_couple_feather_width"] = args[7]
-        if len(args) >= 9:
-            fc_param["forge_couple_boundary_mode"] = args[8]
-        if len(args) >= 10:
-            fc_param["forge_couple_soft_width"] = args[9]
-        if len(args) >= 11:
-            fc_param["forge_couple_soft_strength"] = args[10]
+        # NOTE: this callback has 12 named params (self..def_in_prompt), so *args
+        # starts at separation_mode. (process_before_every_sampling only has 9,
+        # which is why its indices are shifted by +3.)
+        if len(args) >= 1 and args[0] in ("Attention", "Latent", "Hybrid", "Independent"):
+            fc_param["forge_couple_separation_mode"] = args[0]
+        if len(args) >= 2 and args[1] in ("Soft", "Hard", "Temperature"):
+            fc_param["forge_couple_mask_mode"] = args[1]
+        if (
+            len(args) >= 3
+            and isinstance(args[2], (int, float))
+            and not isinstance(args[2], bool)
+        ):
+            fc_param["forge_couple_mask_temperature"] = args[2]
+        if len(args) >= 4 and args[3] in ("Hard", "Feather"):
+            fc_param["forge_couple_blend_mode"] = args[3]
+        if (
+            len(args) >= 5
+            and isinstance(args[4], (int, float))
+            and not isinstance(args[4], bool)
+        ):
+            fc_param["forge_couple_feather_width"] = args[4]
+        if len(args) >= 6 and args[5] in ("Hard", "Soft"):
+            fc_param["forge_couple_boundary_mode"] = args[5]
+        if (
+            len(args) >= 7
+            and isinstance(args[6], (int, float))
+            and not isinstance(args[6], bool)
+        ):
+            fc_param["forge_couple_soft_width"] = args[6]
+        if (
+            len(args) >= 8
+            and isinstance(args[7], (int, float))
+            and not isinstance(args[7], bool)
+        ):
+            fc_param["forge_couple_soft_strength"] = args[7]
 
         p.extra_generation_params.update(fc_param)
         # ===== Infotext =====
@@ -727,6 +741,8 @@ class ForgeCouple(scripts.Script):
                 boundary_mode=boundary_mode,
                 soft_width=soft_width,
                 soft_strength=soft_strength,
+                sdpa_mode=str(getattr(shared.opts, "fc_hybrid_sdpa", "auto") or "auto"),
+                debug=bool(args[1]) if len(args) >= 2 else False,
             ):
                 self.invalidate(p)
             return

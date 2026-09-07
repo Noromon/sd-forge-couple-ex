@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -36,6 +37,137 @@ if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing as P
 
 from lib_couple.logging import logger
+
+
+# ---------------------------------------------------------------------------
+# Deep-copy cache (most conservative optimization)
+# ---------------------------------------------------------------------------
+
+
+class _DeepCopyCache:
+    """LRU cache for the deep-copied per-region sub-modules.
+
+    Only the deepcopy step is cached -- everything else in region preparation
+    (offline LoRA bake, load_model_gpu, CLIP encode, base restore) runs exactly
+    as before on every generation, so forge-side side effects are unchanged.
+    Cached modules were produced by the identical code path for an identical
+    (model, LoRAs) pair, i.e. bit-for-bit equivalent to a fresh deepcopy.
+    """
+
+    def __init__(self, max_entries: int = 1):
+        self._entries: "OrderedDict[tuple, list]" = OrderedDict()
+        self._max = max_entries
+
+    @staticmethod
+    def make_generation_key(sd_model, loras_per_region) -> tuple:
+        """Key for a WHOLE generation's region modules.
+
+        With max_entries=1 this keeps exactly the most recent complete generation;
+        any change to model / LoRAs / strengths misses and rebuilds (the old entry
+        is evicted automatically), so stale weights can never persist across setups.
+        """
+        ckpt = ""
+        for attr in ("sd_model_checkpoint", "ckpt_name"):
+            try:
+                val = getattr(sd_model, attr, "")
+            except Exception:  # noqa: BLE001
+                val = ""
+            if val:
+                ckpt = str(val)
+                break
+        return (
+            id(sd_model),
+            ckpt,
+            tuple(tuple(tuple(l) for l in reg) for reg in loras_per_region),
+        )
+
+    def get(self, key):
+        entries = self._entries
+        if key not in entries:
+            return None
+        entries.move_to_end(key)
+        return entries[key]
+
+    def put(self, key, value):
+        entries = self._entries
+        entries[key] = value
+        entries.move_to_end(key)
+        while len(entries) > self._max:
+            evicted_key, _evicted_val = entries.popitem(last=False)
+            logger.info(f"[Hybrid] Evicting cached region modules (ckpt={evicted_key[1]!r})")
+
+
+_deepcopy_cache = _DeepCopyCache()
+
+
+def _cache_enabled() -> bool:
+    """Whether the region deep-copy cache is on (Settings > Forge Couple)."""
+    try:
+        from modules.shared import opts
+
+        return str(getattr(opts, "fc_hybrid_cache", "last") or "last").lower() != "off"
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# ---------------------------------------------------------------------------
+# SDPA backend control (cross-architecture determinism)
+# ---------------------------------------------------------------------------
+
+_SDPA_BACKENDS: dict[str, list] = {}
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+
+    _SDPA_BACKENDS["flash"] = [SDPBackend.FLASH_ATTENTION]
+    _SDPA_BACKENDS["mem_efficient"] = [SDPBackend.EFFICIENT_ATTENTION]
+    _SDPA_BACKENDS["math"] = [SDPBackend.MATH]
+    if hasattr(SDPBackend, "CUDNN_ATTENTION"):
+        _SDPA_BACKENDS["cudnn"] = [SDPBackend.CUDNN_ATTENTION]
+except ImportError:  # torch < 2.0 (not expected on forge)
+    sdpa_kernel = None
+
+_sdpa_probe_done = False
+
+
+def _probe_sdpa_flags():
+    """Log the current torch SDPA backend flags once, for cross-machine comparison."""
+    global _sdpa_probe_done
+    if _sdpa_probe_done:
+        return
+    _sdpa_probe_done = True
+    try:
+        import torch.backends.cuda as bc
+
+        def _flag(name):
+            fn = getattr(bc, name + "_enabled", None)
+            try:
+                return str(fn()) if callable(fn) else "?"
+            except Exception:  # noqa: BLE001
+                return "?"
+
+        logger.info(
+            "[Hybrid] SDPA flags: flash=%s mem_efficient=%s cudnn=%s math=%s"
+            % (
+                _flag("flash_sdp"),
+                _flag("mem_efficient_sdp"),
+                _flag("cudnn_sdp"),
+                _flag("math_sdp"),
+            )
+        )
+        try:
+            dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "?"
+        except Exception:  # noqa: BLE001
+            dev = "?"
+        logger.info(f"[Hybrid] Env: gpu={dev} torch={torch.__version__}")
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"[Hybrid] SDPA flag probe failed: {e}")
+
+
+def _sdpa_backend_list(mode):
+    """Backend list for `mode`, or None when auto / unsupported (=> torch default)."""
+    if mode == "auto" or sdpa_kernel is None or mode not in _SDPA_BACKENDS:
+        return None
+    return _SDPA_BACKENDS[mode]
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +341,174 @@ def _apply_region_loras_offline(sd_model, loras):
     return unet, clip
 
 
+def _deterministic_region_weights(
+    sd_model, dit_model, target_names: list[str], loras, debug: bool = False
+):
+    """Compute {param_name: bf16 CPU tensor} = base + Σ strength·(α/rank)·(B@A).
+
+    All math runs in fp32 on the CPU, so the result depends ONLY on (checkpoint
+    weights, LoRA files, strengths) -- never on shared-module state, GPU kernels or
+    execution order. This makes region sub-modules bit-identical across generations,
+    restarts and machines, eliminating first-generation weight drift.
+
+    The formula mirrors forge's offline bake exactly (comfy LoRAAdapter: diff =
+    lora_up @ lora_down in fp32, scaled by strength * alpha/rank), applied per LoRA
+    sequentially to match forge's patch order.
+
+    Returns None when an unsupported feature is detected or anything fails; the
+    caller then falls back to the legacy bake-into-shared-module + deepcopy path.
+    """
+    from backend import utils as forge_utils
+    from lib_couple.independent import _get_lora_state_dict
+    from modules_forge.packages.comfy.lora import model_lora_keys_unet
+
+    unet_patcher = sd_model.forge_objects_original.unet
+    active_patcher = sd_model.forge_objects.unet
+
+    # model_lora_keys_unet expects the KModel wrapper (state_dict / .diffusion_model).
+    try:
+        key_map = model_lora_keys_unet(unet_patcher.model)  # {lora_key: full_param_name}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Hybrid] Deterministic path unavailable (key map failed: {e})")
+        return None
+
+    if not key_map:
+        return None
+
+    def _suffix(full: str) -> str:
+        return full[len("diffusion_model."):] if full.startswith("diffusion_model.") else full
+
+    # suffix (blocks.0.cross_attn.q_proj.weight) -> full state_dict name / lora keys
+    full_by_suffix: dict[str, str] = {}
+    rev: dict[str, list[str]] = {}
+    for lk, pname in key_map.items():
+        if isinstance(pname, str) and pname.endswith(".weight"):
+            sfx = _suffix(pname)
+            full_by_suffix.setdefault(sfx, pname)
+            rev.setdefault(sfx, []).append(lk)
+
+    def _base_weight(pname):
+        """Pristine base for a param: original backup -> active backup -> module attr."""
+        full = full_by_suffix.get(pname, pname)
+        for patcher in (unet_patcher, active_patcher):
+            bk = patcher.backup.get(full) if hasattr(patcher, "backup") else None
+            if bk is not None and getattr(bk, "weight", None) is not None:
+                return bk.weight
+        return forge_utils.get_attr(dit_model, pname)
+
+    # Per-LoRA fp32 diffs (CPU), in application order.
+    lora_diffs: list[dict[str, torch.Tensor]] = []
+    for name, strength_unet, _te in loras:
+        if not strength_unet:
+            continue
+        sd = _get_lora_state_dict(name)
+        per_key: dict[str, torch.Tensor] = {}
+        for pname in target_names:
+            for lk in rev.get(pname, ()):  # first matching convention wins
+                up_k = f"{lk}.lora_up.weight"
+                down_k = f"{lk}.lora_down.weight"
+                if up_k not in sd or down_k not in sd:
+                    continue
+                mid_k = f"{lk}.lora_mid.weight"
+                dora_k = f"{lk}.dora_scale"
+                if mid_k in sd or dora_k in sd:
+                    logger.warning(
+                        f"[Hybrid] Deterministic path: unsupported feature "
+                        f"({mid_k if mid_k in sd else dora_k}) for {name}; "
+                        f"falling back to bake path..."
+                    )
+                    return None
+                B = sd[up_k].detach().to(dtype=torch.float32)
+                A = sd[down_k].detach().to(dtype=torch.float32)
+                alpha_k = f"{lk}.alpha"
+                scale = (float(sd[alpha_k]) / A.shape[0]) if alpha_k in sd else 1.0
+                per_key[pname] = torch.mm(
+                    B.reshape(B.shape[0], -1), A.reshape(A.shape[0], -1)
+                ) * (strength_unet * scale)
+                break
+        lora_diffs.append(per_key)
+
+    # Verify: every target param that this region's LoRAs are supposed to modify must
+    # have been resolved; otherwise a naming mismatch would silently drop effects.
+    expected_modified = set()
+    for name, strength_unet, _te in loras:
+        if not strength_unet:
+            continue
+        sd = _get_lora_state_dict(name)
+        for lk, pname in key_map.items():
+            if isinstance(pname, str) and f"{lk}.lora_up.weight" in sd:
+                expected_modified.add(_suffix(pname))
+    missing = (expected_modified & set(target_names)) - {
+        p for pk in lora_diffs for p in pk
+    }
+    if missing:
+        logger.warning(
+            f"[Hybrid] Deterministic path: {len(missing)} expected LoRA targets "
+            f"unresolved (e.g. {sorted(missing)[:2]}); falling back to bake path..."
+        )
+        return None
+
+    # Materialize ONLY the params that received at least one LoRA diff; untouched
+    # params keep their (pristine base) values from the structural deep copies.
+    modified = {p for pk in lora_diffs for p in pk}
+    out: dict[str, torch.Tensor] = {}
+    for pname in sorted(modified):
+        acc = _base_weight(pname).detach().to(dtype=torch.float32).cpu()
+        for per_key in lora_diffs:  # sequential, mirrors forge patch order
+            d = per_key.get(pname)
+            if d is not None:
+                if d.shape != acc.shape:
+                    logger.warning(
+                        f"[Hybrid] Deterministic path: shape mismatch for {pname} "
+                        f"({tuple(d.shape)} vs {tuple(acc.shape)}); falling back..."
+                    )
+                    return None
+                acc += d
+        out[pname] = acc.to(dtype=torch.bfloat16)
+
+    if debug:
+        logger.info(
+            f"[Hybrid][FP] deterministic weights: {len(out)} params modified "
+            f"by {len(lora_diffs)} LoRA set(s)"
+        )
+    return out
+
+
+def _apply_region_weights(mod, prefix: str, rw: dict[str, torch.Tensor]) -> int:
+    """Overwrite a module's parameters from the pre-computed region weight map.
+
+    Returns the number of parameters actually replaced (for verification).
+    """
+    n = 0
+    for pn, param in mod.named_parameters():
+        full = f"{prefix}.{pn}"
+        if full in rw:
+            with torch.no_grad():
+                param.copy_(rw[full].to(device=param.device, dtype=param.dtype))
+            n += 1
+    return n
+
+
+def _iter_unet_attn_with_paths(unet_model):
+    """Yield (param_prefix, attn2_module) in forward order.
+
+    Mirrors _iter_unet_attn_blocks but also reports each layer's state_dict prefix so
+    deterministic weights can be addressed by full parameter name.
+    """
+    for di, down in enumerate(unet_model.down_blocks):
+        for li, layer in enumerate(down.layers):
+            if hasattr(layer, "attn2"):
+                yield f"down_blocks.{di}.layers.{li}", layer.attn2
+    mid = unet_model.mid_block
+    for li, layer in enumerate(getattr(mid, "layers", [])):
+        if hasattr(layer, "attn2"):
+            yield f"mid_block.layers.{li}", layer.attn2
+    for ui, up in enumerate(unet_model.up_blocks):
+        for li, layer in enumerate(up.layers):
+            if hasattr(layer, "attn2"):
+                yield f"up_blocks.{ui}.layers.{li}", layer.attn2
+
+
 def _is_anima_model(dit) -> bool:
     """Detect an Anima DiT (has .blocks of Block modules with cross_attn)."""
     blocks = getattr(dit, "blocks", None)
@@ -239,12 +539,38 @@ def _iter_unet_attn_blocks(unet_model):
 # ---------------------------------------------------------------------------
 
 
+def _tensor_fp(t: torch.Tensor) -> str:
+    """Compact numeric fingerprint of a tensor (fp32 scalars)."""
+    try:
+        tf = t.detach().to(dtype=torch.float32)
+        s = float(tf.sum().item())
+        m = float(tf.abs().max().item()) if tf.numel() else 0.0
+        head = [round(float(v), 6) for v in tf.flatten()[:4].tolist()]
+        return f"sum={s:.6f} maxabs={m:.6f} head={head}"
+    except Exception as e:  # noqa: BLE001
+        return f"<fp failed: {e}>"
+
+
+def _modules_fp(modules) -> str:
+    """Aggregate fingerprint over a region's deep-copied modules (Anima blocks / UNet qkv)."""
+    total = 0.0
+    n_params = 0
+    for item in modules:
+        mods = [m for m in item if hasattr(m, "parameters")] if isinstance(item, tuple) else [item]
+        for mod in mods:
+            for p_ in mod.parameters():
+                total += float(p_.detach().to(dtype=torch.float32).sum().item())
+                n_params += 1
+    return f"params={n_params} sumall={total:.6f}"
+
+
 def _prepare_regions(
     sd_model,
     loras_per_region: list[list[tuple[str, float, float]]],
     region_texts: list[str],
     width: int,
     height: int,
+    debug: bool = False,
 ):
     """Prepare per-region LoRA-patched sub-modules and text contexts.
 
@@ -266,47 +592,164 @@ def _prepare_regions(
     dit_orig = unet_orig.model.diffusion_model
     is_anima = _is_anima_model(dit_orig)
 
-    # Ensure the shared nn.Module starts from pristine base weights. The ACTIVE patcher
-    # (forge_objects.unet) has baked all-LoRA weights and its backup dict holds true base.
-    # Restoring from it guarantees we start clean before per-region baking.
+    def _ensure_base(patcher):
+        """Guarantee pristine base in the shared module + a filled backup dict.
+
+        On the very first Hybrid run of a session, forge has baked all-LoRA weights
+        into the shared nn.Module but the patcher's backup dict may still be empty
+        (nothing was ever restored). Baking every pending key once fills the backup
+        with pristine base; restoring then puts the module back to true base. This
+        removes first-generation weight drift from BOTH code paths below.
+        """
+        try:
+            if getattr(patcher, "patches", None) and not getattr(patcher, "backup", None):
+                for key in list(patcher.patches.keys()):
+                    patcher.patch_weight_to_device(key)
+            _restore_from_backup(patcher)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Hybrid] Failed to ensure base state: {e}")
+
     active_unet = sd_model.forge_objects.unet
-    _restore_from_backup(active_unet)
+    _ensure_base(active_unet)
 
     clip_orig = sd_model.forge_objects_original.clip
     if clip_orig is not None:
-        active_clip = sd_model.forge_objects.clip
-        _restore_from_backup(_as_patcher(active_clip))
+        _ensure_base(_as_patcher(sd_model.forge_objects.clip))
 
+    if debug and is_anima:
+        try:
+            total, n_p = 0.0, 0
+            for b in dit_orig.blocks:
+                for mod in (b.cross_attn, b.mlp):
+                    for p_ in mod.parameters():
+                        total += float(p_.detach().to(dtype=torch.float32).sum().item())
+                        n_p += 1
+            logger.info(f"[Hybrid][FP] base_dit params={n_p} sumall={total:.6f}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Hybrid][FP] base fingerprint failed: {e}")
 
     region_modules: list[list] = []
     region_contexts: list[Optional[torch.Tensor]] = []
 
     from backend import memory_management
 
+    # --- Deterministic (CPU fp32) region weights, computed once per unique LoRA set.
+    #     None => that region falls back to the legacy bake-into-shared + deepcopy path. ---
+    cache_on = _cache_enabled()
+    det_cache: dict[tuple, Optional[dict]] = {}
+
+    # Whole-generation deep-copy cache (only the most recent complete generation is
+    # kept). A hit means every region's LoRA set matches the previous run exactly.
+    gen_key = _deepcopy_cache.make_generation_key(sd_model, loras_per_region)
+    cached_all = None
+    if cache_on:
+        cached_all = _deepcopy_cache.get(gen_key)
+        if cached_all is not None and len(cached_all) != n_regions:
+            cached_all = None
+
+    def _region_weights(loras):
+        key = tuple(tuple(x) for x in loras)
+        if key not in det_cache:
+            rw = None
+            try:
+                from backend.args import dynamic_args
+
+                if not dynamic_args.nunchaku:
+                    if is_anima:
+                        names = []
+                        for j, b in enumerate(dit_orig.blocks):
+                            for mod_name in ("cross_attn", "mlp"):
+                                for pn, _ in getattr(b, mod_name).named_parameters():
+                                    names.append(f"blocks.{j}.{mod_name}.{pn}")
+                    else:
+                        names = []
+                        for prefix, a2 in _iter_unet_attn_with_paths(dit_orig):
+                            for attr in ("q", "k", "v"):
+                                for pn, _ in getattr(a2, attr).named_parameters():
+                                    names.append(f"{prefix}.{attr}.{pn}")
+                    if names:
+                        rw = _deterministic_region_weights(
+                            sd_model, dit_orig, names, loras, debug=debug
+                        )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[Hybrid] Deterministic weight path failed ({e}); using bake path..."
+                )
+                rw = None
+            det_cache[key] = rw
+        return det_cache[key]
+
     for r in range(n_regions):
         loras = loras_per_region[r] if r < len(loras_per_region) else []
         unet_r, clip_r = _apply_region_loras_offline(sd_model, loras)
 
-        # --- Bake UNet patches into the shared module & deep-copy sub-modules ---
-        _bake_patcher(unet_r)
-        memory_management.load_model_gpu(unet_r)  # ensure ALL weights on GPU before copy
-        dit_r = unet_r.model.diffusion_model
-
-        if is_anima:
-            blocks_copy: list[tuple] = []
-            for b in dit_r.blocks:
-                ca = copy.deepcopy(b.cross_attn)
-                ml = copy.deepcopy(b.mlp)
-                blocks_copy.append((ca, ml))
-            region_modules.append(blocks_copy)
+        if cached_all is not None:
+            # Same (model, LoRAs) as the previous generation: the deep copies are
+            # bit-for-bit identical to what we would produce now -- reuse them.
+            region_modules.append(cached_all[r])
+            logger.info(
+                f"[Hybrid] Region {r + 1}/{n_regions} reusing cached deep-copies"
+            )
         else:
-            qkv_copy: list[tuple] = []
-            for layer in _iter_unet_attn_blocks(dit_r):
-                a2 = layer.attn2
-                qkv_copy.append(
-                    (copy.deepcopy(a2.q), copy.deepcopy(a2.k), copy.deepcopy(a2.v))
-                )
-            region_modules.append(qkv_copy)
+            rw = _region_weights(loras)
+
+            if rw is not None:
+                # Deterministic path: structural deepcopy of base modules with the
+                # pre-computed region weights copied in. Independent of shared-module
+                # state / GPU kernels => bit-identical across runs, restarts & machines.
+                from modules.devices import device as fc_device
+
+                if is_anima:
+                    blocks_copy: list[tuple] = []
+                    for j, b in enumerate(dit_orig.blocks):
+                        ca = copy.deepcopy(b.cross_attn).to(fc_device)
+                        ml = copy.deepcopy(b.mlp).to(fc_device)
+                        _apply_region_weights(ca, f"blocks.{j}.cross_attn", rw)
+                        _apply_region_weights(ml, f"blocks.{j}.mlp", rw)
+                        blocks_copy.append((ca, ml))
+                    region_modules.append(blocks_copy)
+                else:
+                    qkv_copy: list[tuple] = []
+                    for prefix, a2 in _iter_unet_attn_with_paths(dit_orig):
+                        q = copy.deepcopy(a2.q).to(fc_device)
+                        k = copy.deepcopy(a2.k).to(fc_device)
+                        v = copy.deepcopy(a2.v).to(fc_device)
+                        _apply_region_weights(q, f"{prefix}.q", rw)
+                        _apply_region_weights(k, f"{prefix}.k", rw)
+                        _apply_region_weights(v, f"{prefix}.v", rw)
+                        qkv_copy.append((q, k, v))
+                    region_modules.append(qkv_copy)
+
+                if debug:
+                    logger.info(
+                        f"[Hybrid] Region {r + 1}/{n_regions} built deterministically"
+                    )
+            else:
+                # Legacy path: bake this region's LoRAs into the shared module & copy.
+                _bake_patcher(unet_r)
+                memory_management.load_model_gpu(
+                    unet_r
+                )  # ensure ALL weights on GPU before copy
+                dit_r = unet_r.model.diffusion_model
+
+                if is_anima:
+                    blocks_copy: list[tuple] = []
+                    for b in dit_r.blocks:
+                        ca = copy.deepcopy(b.cross_attn)
+                        ml = copy.deepcopy(b.mlp)
+                        blocks_copy.append((ca, ml))
+                    region_modules.append(blocks_copy)
+                else:
+                    qkv_copy: list[tuple] = []
+                    for layer in _iter_unet_attn_blocks(dit_r):
+                        a2 = layer.attn2
+                        qkv_copy.append(
+                            (copy.deepcopy(a2.q), copy.deepcopy(a2.k), copy.deepcopy(a2.v))
+                        )
+                    region_modules.append(qkv_copy)
+
+        if debug:
+            logger.info(f"[Hybrid][FP] region{r + 1} unet={_modules_fp(region_modules[r])}")
 
         # --- Bake CLIP patches & encode this region's text under its TE LoRAs.
         #     get_learned_conditioning uses forge_objects.clip.patcher, so swap it in. ---
@@ -329,6 +772,12 @@ def _prepare_regions(
 
         region_contexts.append(ctx.to(dtype=torch.float32) if ctx is not None else None)
 
+        if debug and ctx is not None:
+            c32 = ctx.to(dtype=torch.float32)
+            logger.info(
+                f"[Hybrid][FP] region{r + 1} ctx shape={tuple(c32.shape)} {_tensor_fp(c32)}"
+            )
+
         # --- Restore base before the next region so diffs don't accumulate ---
         _restore_from_backup(unet_r)
         if clip_orig is not None:
@@ -339,6 +788,15 @@ def _prepare_regions(
             f"[Hybrid] Region {r + 1}/{n_regions} prepared "
             f"({len(loras)} LoRAs, ctx={'ok' if ctx is not None else 'fallback'})"
         )
+
+    # Store this generation's modules (miss only; a hit already refreshed the LRU).
+    if cache_on and cached_all is None:
+        _deepcopy_cache.put(gen_key, list(region_modules))
+
+    # Ensure the shared DiT/UNet is fully resident on GPU before sampling. The legacy
+    # path did this implicitly via per-region load_model_gpu; the deterministic path
+    # skips it, and forge may have offloaded the model between generations (gen-2 crash).
+    memory_management.load_model_gpu(unet_orig)
 
     return region_modules, region_contexts
 
@@ -409,6 +867,8 @@ def patch_dit_hybrid(
     boundary_mode: str = "Hard",
     soft_width: float = 0.0,
     soft_strength: float = 1.0,
+    sdpa_mode: str = "auto",
+    debug: bool = False,
 ):
     """Patch the Anima DiT for Hybrid separation mode (Block-level).
 
@@ -421,6 +881,16 @@ def patch_dit_hybrid(
     """
     from einops import rearrange
     from modules.devices import device, dtype
+
+    _probe_sdpa_flags()
+
+    if sdpa_mode != "auto":
+        if _sdpa_backend_list(sdpa_mode) is None:
+            logger.warning(
+                f"[Hybrid] SDPA backend '{sdpa_mode}' unavailable; using auto..."
+            )
+        else:
+            logger.info(f"[Hybrid] SDPA backend pinned to '{sdpa_mode}'")
 
     # Clone the unet wrapper and clear LoRA patches so that at sampling start
     # load_model_gpu bakes nothing and the shared DiT stays pristine base (self-attn /
@@ -439,7 +909,7 @@ def patch_dit_hybrid(
         return None
 
     region_modules, region_contexts_raw = _prepare_regions(
-        sd_model, loras_per_region, region_texts, width, height
+        sd_model, loras_per_region, region_texts, width, height, debug=debug
     )
 
     if len(region_modules[0]) != num_blocks:
@@ -480,7 +950,7 @@ def patch_dit_hybrid(
         base_blk = base_dit.blocks[j]
         reg_mods = [region_modules[r][j] for r in range(n_regions)]
         dit.blocks[j].forward = _make_anima_hybrid_forward(
-            base_blk, reg_mods, n_regions, token_masks, region_contexts
+            base_blk, reg_mods, n_regions, token_masks, region_contexts, sdpa_mode
         )
 
     return unet
@@ -501,6 +971,8 @@ def run_hybrid(
     boundary_mode: str = "Hard",
     soft_width: float = 0.0,
     soft_strength: float = 1.0,
+    sdpa_mode: str = "auto",
+    debug: bool = False,
 ) -> bool:
     """Patch the active model for Hybrid separation and swap it into forge_objects.
 
@@ -524,6 +996,7 @@ def run_hybrid(
         patched = patch_dit_hybrid(
             sd_model, width, height, fc_args, loras_per_region, region_texts,
             boundary_mode=boundary_mode, soft_width=soft_width, soft_strength=soft_strength,
+            sdpa_mode=sdpa_mode, debug=debug,
         )
     else:
         patched = patch_unet_hybrid(
@@ -587,11 +1060,18 @@ def unpatch_dit_hybrid(sd_model):
         del dit._hybrid_saved_forwards
 
 
-def _make_anima_hybrid_forward(base_blk, reg_mods, n_reg, t_masks, r_ctxs):
+def _make_anima_hybrid_forward(
+    base_blk, reg_mods, n_reg, t_masks, r_ctxs, sdpa_mode: str = "auto"
+):
     from einops import rearrange
 
+    # Optional SDPA backend pinning (cross-architecture determinism). A fresh
+    # one-shot context manager is created per block call because torch's
+    # sdpa_kernel() returns a single-use _GeneratorContextManager.
+    sdpa_backends = _sdpa_backend_list(sdpa_mode)
+
     @torch.inference_mode()
-    def hybrid_forward(
+    def _hybrid_body(
         x_B_T_H_W_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         crossattn_emb: torch.Tensor,
@@ -772,6 +1252,42 @@ def _make_anima_hybrid_forward(base_blk, reg_mods, n_reg, t_masks, r_ctxs):
             x_B_T_H_W_D = torch.cat(x_chunks, dim=0)
 
         return x_B_T_H_W_D
+
+    if sdpa_backends is None:
+        return _hybrid_body
+
+    state = {"fallback_warned": False}
+
+    @torch.inference_mode()
+    def hybrid_forward(
+        x_B_T_H_W_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        transformer_options: Optional[dict] = {},
+    ) -> torch.Tensor:
+        try:
+            with sdpa_kernel(sdpa_backends):
+                return _hybrid_body(
+                    x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D,
+                    adaln_lora_B_T_3D, extra_per_block_pos_emb, transformer_options,
+                )
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if not any(k in msg for k in ("kernel", "backend", "sdpa")):
+                raise
+            if not state["fallback_warned"]:
+                state["fallback_warned"] = True
+                logger.warning(
+                    f"[Hybrid] SDPA backend '{sdpa_mode}' unavailable at runtime ({e}); "
+                    f"falling back to auto for this generation..."
+                )
+            return _hybrid_body(
+                x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D,
+                adaln_lora_B_T_3D, extra_per_block_pos_emb, transformer_options,
+            )
 
     return hybrid_forward
 
