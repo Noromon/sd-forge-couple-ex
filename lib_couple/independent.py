@@ -8,6 +8,9 @@ then blended in latent space according to the region masks.
 
 Cost: n x sampling time.  Benefit: complete isolation of LoRA / prompt features
 between regions (no cross-region bleed), for both DiT (Anima) and SD1/SDXL.
+
+Author: Noromon (2026)
+Copyright (C) 2026 Noromon
 """
 
 from typing import TYPE_CHECKING, Optional

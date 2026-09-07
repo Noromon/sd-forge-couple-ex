@@ -21,6 +21,9 @@ Supported architectures:
 Boundary handling: regions are routed at the token level. "Hard" = winner-take-all
 (every pixel belongs to one region); "Soft" = Gaussian-blended transition band so
 adjacent regions share a smooth overlap instead of a hard seam.
+
+Author: Noromon (2026)
+Copyright (C) 2026 Noromon
 """
 
 from __future__ import annotations
