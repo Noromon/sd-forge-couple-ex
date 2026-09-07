@@ -8,6 +8,8 @@ from .ui_funcs import on_pull
 from .ui_masks import CoupleMaskData
 from .ui_tile import tile_ui
 
+from .logging import logger
+
 
 class CoupleDataTransfer:
     """Handle sending data from t2i/i2i to i2i/t2i"""
@@ -343,6 +345,50 @@ def couple_ui(script, is_img2img: bool, title: str):
             show_progress="hidden",
         ).success(fn=None, **js(f'() => {{ ForgeCouple.preview("{m}"); }}'))
 
+        # --- Defaults auto-sync -------------------------------------------------
+        # Forge's "Defaults" feature (modules/ui_loadsave.py) restores saved values via
+        # setattr() at build time, which does NOT fire the .change() handlers above. So a
+        # restored parent value (e.g. Separation Method=Hybrid, Boundary=Hard) would leave
+        # dependent sub-groups with stale visibility/interactivity until re-toggled. Re-apply
+        # all derived UI state once on page load so it matches the restored values.
+        def _sync_dependent_ui(
+            mode_val, background_val, separation_mode_val,
+            mask_mode_val, blend_mode_val, boundary_mode_val,
+        ):
+            return [
+                gr.update(visible=(mode_val in ("Basic", "Mask"))),       # basic_settings
+                gr.update(visible=(mode_val == "Basic")),                 # direction
+                gr.update(visible=(mode_val == "Advanced")),              # adv_settings
+                gr.update(visible=(mode_val == "Mask")),                  # msk_settings
+                gr.update(visible=(mode_val == "Mask")),                  # placeholder
+                gr.update(interactive=(background_val != "None")),        # background_weight
+                gr.update(visible=(separation_mode_val == "Attention")),  # sharp_settings
+                gr.update(visible=(separation_mode_val in ("Independent",))),  # blend_settings
+                gr.update(visible=(separation_mode_val == "Hybrid")),     # hybrid_settings
+                gr.update(interactive=(mask_mode_val == "Temperature")),  # mask_temperature
+                gr.update(interactive=(blend_mode_val == "Feather")),     # feather_width
+                gr.update(interactive=(boundary_mode_val == "Soft")),     # soft_width
+                gr.update(interactive=(boundary_mode_val == "Soft")),     # soft_strength
+            ]
+
+        try:
+            _root = enable
+            while not isinstance(_root, gr.Blocks):
+                _root = getattr(_root, "parent", None)
+                if _root is None:
+                    raise RuntimeError("no root Blocks found")
+            _root.load(
+                fn=_sync_dependent_ui,
+                inputs=[mode, background, separation_mode, mask_mode, blend_mode, boundary_mode],
+                outputs=[
+                    basic_settings, direction, adv_settings, msk_settings, placeholder,
+                    background_weight, sharp_settings, blend_settings, hybrid_settings,
+                    mask_temperature, feather_width, soft_width, soft_strength,
+                ],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Forge Couple] Defaults auto-sync not attached: {e}")
+
         script.paste_field_names = []
         script.infotext_fields = [
             (enable, "forge_couple"),
@@ -365,7 +411,6 @@ def couple_ui(script, is_img2img: bool, title: str):
         ]
 
         for comp, name in script.infotext_fields:
-            comp.do_not_save_to_config = True
             script.paste_field_names.append(name)
 
         if is_img2img and not getattr(opts, "fc_no_tile", False):

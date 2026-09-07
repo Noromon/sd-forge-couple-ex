@@ -1,3 +1,9 @@
+### v8.0.1 - 2026 Sep.07
+- Fix first generation after WebUI startup always producing broken images when using **Hybrid** separation (deterministic region weights)
+- Performance optimization (region module cache reuse across generations)
+- Fix "Load Last Parameters" not fully restoring Forge Couple settings
+- Forge Couple UI defaults are now managed by Forge's **Defaults** feature
+
 ### v8.0.0 - 2026 Sep.04
 - **Separation Method** selector: `Attention` / `Latent` / `Hybrid` / `Independent`
     - **Hybrid**: global self-attn + per-region cross-attn/MLP; full LoRA isolation with coherent composition at seams (~1x time); new **Boundary Transition** control (`Hard` / Gaussian-blended `Soft`)
