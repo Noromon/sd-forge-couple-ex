@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import math
+import uuid
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
@@ -902,6 +903,12 @@ def patch_dit_hybrid(
     unet = active_unet.clone()
     unet.patches = {}
     unet.online_patches = {}
+    # clone() keeps the source's patches_uuid; with the LoRA patches cleared that id
+    # would falsely claim "the all-LoRA weights are baked" into the shared module, so
+    # forge (current_lora_hash hit + uuid match) would skip re-baking the LoRAs for
+    # the next same-LoRA generation. A fresh uuid keeps the bookkeeping honest: the
+    # shared module stays base + this clone's own (empty) patch-set id.
+    unet.patches_uuid = uuid.uuid4()
 
     dit = unet.model.diffusion_model
     num_blocks = len(dit.blocks)
@@ -994,6 +1001,16 @@ def run_hybrid(
         unpatch_dit_hybrid(sd_model)
 
     saved_unet = sd_model.forge_objects.unet
+    # The HiRes pass (and extra batch iterations) re-runs this hook with
+    # forge_objects.unet already pointing at a previous Hybrid clone; keep the
+    # genuine all-LoRA patcher saved on the first call instead of overwriting it
+    # with a LoRA-less clone (restore_hybrid must get the real one back).
+    keep_existing_saved = (
+        getattr(sd_model, "_hybrid_saved_unet", None) is not None
+        and getattr(saved_unet, "_fc_hybrid_clone", False)
+    )
+    if not keep_existing_saved:
+        sd_model._hybrid_saved_unet = saved_unet
 
     if is_anima:
         patched = patch_dit_hybrid(
@@ -1010,16 +1027,14 @@ def run_hybrid(
     if patched is None:
         return False
 
-    # Remember the original unet so we can restore it after this generation.
-    sd_model._hybrid_saved_unet = saved_unet
+    patched._fc_hybrid_clone = True
 
+    # forge_objects_after_applying_lora must keep pointing at the genuine LoRA-applied
+    # model: the HiRes pass / next batch iteration resets forge_objects from it and
+    # this hook re-patches on top, with _ensure_base bringing the shared module back
+    # to base first. Pointing it at a Hybrid clone silently evicts the real LoRA
+    # patcher from every later generation while the LoRA-hash cache keeps skipping.
     sd_model.forge_objects.unet = patched
-    try:
-        sd_model.forge_objects_after_applying_lora = (
-            sd_model.forge_objects.shallow_copy()
-        )
-    except Exception:  # noqa: BLE001
-        pass
 
     logger.info(f"[Hybrid] Installed {'Anima' if is_anima else 'UNet'} hybrid unet")
     return True
@@ -1044,6 +1059,14 @@ def restore_hybrid(sd_model):
                 sd_model.forge_objects_after_applying_lora = (
                     sd_model.forge_objects.shallow_copy()
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            # Belt & suspenders: the Hybrid run left the shared module at base weights.
+            # Mark the shared model's baked-patch id stale so the next load of the
+            # restored (all-LoRA) patcher goes through forge's restore + re-bake path,
+            # even if a previous generation was interrupted before re-patching.
+            try:
+                saved.model.current_weight_patches_uuid = uuid.uuid4()
             except Exception:  # noqa: BLE001
                 pass
             del sd_model._hybrid_saved_unet
@@ -1344,6 +1367,9 @@ def patch_unet_hybrid(
     # the deep-copied per-region projections, not from a global bake).
     unet.patches = {}
     unet.online_patches = {}
+    # Same as the Anima path: replace the cloned patches_uuid so the empty patch set
+    # is never mistaken for the baked all-LoRA set by forge's load-time uuid check.
+    unet.patches_uuid = uuid.uuid4()
 
     unet_model = unet.model.diffusion_model
     n_regions = len(loras_per_region)

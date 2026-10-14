@@ -1,3 +1,6 @@
+### Unreleased
+- Fix LoRAs being lost or distorted in normal generations after a Hybrid run (incl. HiRes fix / batch) when reusing the same LoRA combination
+
 ### v8.0.1 - 2026 Sep.07
 - Fix first generation after WebUI startup always producing broken images when using **Hybrid** separation (deterministic region weights)
 - Performance optimization (region module cache reuse across generations)
